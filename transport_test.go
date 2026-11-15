@@ -22,7 +22,7 @@ func TestProtocolFailures(t *testing.T) {
 			listCalls := 0
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				var req map[string]any
-				json.NewDecoder(r.Body).Decode(&req)
+				requireNoError(t, json.NewDecoder(r.Body).Decode(&req))
 				method := req["method"]
 				id := req["id"]
 				w.Header().Set("Content-Type", "application/json")
@@ -79,17 +79,17 @@ func TestProtocolFailures(t *testing.T) {
 						w.WriteHeader(403)
 						return
 					case "oversize":
-						fmt.Fprint(w, strings.Repeat(" ", receiveLimit+1))
+						_, _ = fmt.Fprint(w, strings.Repeat(" ", receiveLimit+1))
 						return
 					}
 				}
 				if tc.name == "sse-multiline" {
 					b, _ := json.Marshal(result)
 					w.Header().Set("Content-Type", "text/event-stream")
-					fmt.Fprintf(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\ndata: \"id\":%v,\"result\":%s}\n\n", id, b)
+					_, _ = fmt.Fprintf(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\ndata: \"id\":%v,\"result\":%s}\n\n", id, b)
 					return
 				}
-				json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
+				requireNoError(t, json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": id, "result": result}))
 			}))
 			defer srv.Close()
 			t.Setenv("EXAMPLE_ENDPOINT", srv.URL)
@@ -136,7 +136,7 @@ func TestCompareDifferenceAndRetention(t *testing.T) {
 	two := run(t, a, callArgs(), 0)
 	b, _ := os.ReadFile(a.ConfigPath)
 	var cfg Config
-	json.Unmarshal(b, &cfg)
+	requireNoError(t, json.Unmarshal(b, &cfg))
 	s, _, e := readSnapshot(cfg, two.Meta.RawID)
 	if e != nil {
 		t.Fatal(e)
@@ -145,8 +145,8 @@ func TestCompareDifferenceAndRetention(t *testing.T) {
 	s.Meta.RawSHA256 = hashValue(s.Pages)
 	s.Integrity = snapshotIntegrity(s)
 	b, _ = json.Marshal(s)
-	os.WriteFile(s.Meta.Raw, b, 0600)
-	os.Chtimes(s.Meta.Raw, s.Meta.FetchedAt, s.Meta.FetchedAt)
+	requireNoError(t, os.WriteFile(s.Meta.Raw, b, 0600))
+	requireNoError(t, os.Chtimes(s.Meta.Raw, s.Meta.FetchedAt, s.Meta.FetchedAt))
 	out := run(t, a, []string{"compare", "example-server", "example_read", "--raw-id", one.Meta.RawID, "--baseline-id", two.Meta.RawID}, 2)
 	log, st, e := readSafe(out.Meta.DiffLog, receiveLimit)
 	if e != nil || st.Mode().Perm() != 0600 {
@@ -173,7 +173,7 @@ func TestDeadlineNoProgressReset(t *testing.T) {
 			case <-r.Context().Done():
 				return
 			case <-tick.C:
-				fmt.Fprint(w, ": progress\n\n")
+				_, _ = fmt.Fprint(w, ": progress\n\n")
 				f.Flush()
 			}
 		}
@@ -207,7 +207,9 @@ func TestTokenReread(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer c.http.CloseIdleConnections()
-	c.rpc(context.Background(), "notifications/initialized", nil)
+	_, e = c.rpc(context.Background(), "notifications/initialized", nil)
+	requireNoError(t, e)
 	t.Setenv("EXAMPLE_TOKEN", "example-second")
-	c.rpc(context.Background(), "notifications/initialized", nil)
+	_, e = c.rpc(context.Background(), "notifications/initialized", nil)
+	requireNoError(t, e)
 }

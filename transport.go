@@ -32,7 +32,7 @@ func newClient(s Server) (*client, error) {
 	if e != nil || u.Host == "" || u.User != nil || u.Fragment != "" || (u.Scheme != "https" && u.Scheme != "http") {
 		return nil, fail(5, "endpoint_invalid")
 	}
-	if u.Scheme == "http" && u.Hostname() != "localhost" && !net.ParseIP(u.Hostname()).IsLoopback() {
+	if u.Scheme == "http" && u.Hostname() != "localhost" && !net.ParseIP(u.Hostname()).IsLoopback() && !plainHostAllowed(s, u.Hostname()) {
 		return nil, fail(5, "endpoint_requires_tls")
 	}
 	return &client{server: s, endpoint: endpoint, http: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
@@ -73,7 +73,7 @@ func (c *client) rpc(ctx context.Context, method string, params any) (any, error
 	if e != nil {
 		return nil, fail(2, "transport_failed")
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }() // Response content is checked while reading.
 	if res.StatusCode == 401 || res.StatusCode == 403 {
 		return nil, fail(3, "authentication")
 	}
@@ -255,4 +255,36 @@ func (c *client) tools(ctx context.Context) (map[string]any, error) {
 		cursor = s
 	}
 	return nil, fail(2, "tools_page_limit")
+}
+
+// Host entries contain no scheme, port, wildcard, or URL syntax.
+func validPlainHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	if len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+func plainHostAllowed(s Server, host string) bool {
+	for _, allowed := range s.AllowPlainHTTPHosts {
+		if host == allowed {
+			return true
+		}
+	}
+	return false
 }

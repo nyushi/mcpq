@@ -30,9 +30,10 @@ type Config struct {
 	Servers  map[string]Server `json:"servers"`
 }
 type Server struct {
-	EndpointEnv string            `json:"endpoint_env"`
-	TokenEnv    string            `json:"token_env"`
-	Tools       map[string]Policy `json:"tools"`
+	AllowPlainHTTPHosts []string          `json:"allow_plain_http_hosts,omitempty"`
+	EndpointEnv         string            `json:"endpoint_env"`
+	TokenEnv            string            `json:"token_env"`
+	Tools               map[string]Policy `json:"tools"`
 }
 type Policy struct {
 	SchemaHash string           `json:"schema_hash"`
@@ -67,6 +68,8 @@ type Meta struct {
 	ContentBlocks       int            `json:"content_blocks"`
 	Matched             int            `json:"matched"`
 	Shape               string         `json:"shape,omitempty"`
+	ShapeAdded          *[]string      `json:"shape_added,omitempty"`
+	ShapeRemoved        *[]string      `json:"shape_removed,omitempty"`
 	TopKeys             []string       `json:"top_keys,omitempty"`
 	Reason              string         `json:"reason,omitempty"`
 	Code                int            `json:"code"`
@@ -121,6 +124,8 @@ func (c *Completeness) UnmarshalJSON(b []byte) error {
 }
 
 type Snapshot struct {
+	Status    string `json:"status,omitempty"`
+	Reason    string `json:"reason,omitempty"`
 	Meta      Meta   `json:"meta"`
 	Pages     []any  `json:"pages"`
 	Integrity string `json:"integrity_sha256"`
@@ -247,7 +252,7 @@ func safeOpen(p string) (*os.File, error) {
 	f := os.NewFile(uintptr(fd), p)
 	st, err := f.Stat()
 	if err != nil || !st.Mode().IsRegular() {
-		f.Close()
+		_ = f.Close()
 		return nil, fail(2, "not_regular")
 	}
 	return f, nil
@@ -263,7 +268,7 @@ func readSafe(p string, max int64) ([]byte, os.FileInfo, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }() // Read-only descriptor cleanup.
 	st, err := f.Stat()
 	if err != nil {
 		return nil, nil, fail(2, "stat_failed")
@@ -307,6 +312,11 @@ func loadConfig(path string) (Config, error) {
 		c.Shadow = "."
 	}
 	for _, s := range c.Servers {
+		for _, host := range s.AllowPlainHTTPHosts {
+			if !validPlainHost(host) {
+				return c, fail(5, "config_plain_http_host")
+			}
+		}
 		if s.EndpointEnv == "" {
 			return c, fail(5, "config_endpoint_env")
 		}

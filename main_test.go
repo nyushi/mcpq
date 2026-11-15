@@ -12,8 +12,6 @@ import (
 	"time"
 )
 
-const schema = `{"type":"object"}`
-
 func fixture(t *testing.T, mode string) (*App, *int) {
 	t.Helper()
 	calls := 0
@@ -68,16 +66,16 @@ func fixture(t *testing.T, mode string) (*App, *int) {
 				}
 			}
 			if mode == "rpc" {
-				fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"error":{"code":-1,"message":"secret"}}`, req.ID)
+				_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"error":{"code":-1,"message":"secret"}}`, req.ID)
 				return
 			}
 			if mode == "disconnect" {
 				w.Header().Set("Content-Type", "text/event-stream")
-				fmt.Fprint(w, "data: {\"jsonrpc\":\"2.0\"")
+				_, _ = fmt.Fprint(w, "data: {\"jsonrpc\":\"2.0\"")
 				return
 			}
 			if mode == "missing" {
-				fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d}`, req.ID)
+				_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d}`, req.ID)
 				return
 			}
 			target := map[string]any{"items": []any{json.Number("9007199254740993123456789")}, "next": nil}
@@ -101,16 +99,16 @@ func fixture(t *testing.T, mode string) (*App, *int) {
 			}
 			if mode == "sse" {
 				w.Header().Set("Content-Type", "text/event-stream")
-				fmt.Fprintf(w, "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":", req.ID)
+				_, _ = fmt.Fprintf(w, "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":", req.ID)
 				b, _ := json.Marshal(result)
-				fmt.Fprintf(w, "%s}\n\n", b)
+				_, _ = fmt.Fprintf(w, "%s}\n\n", b)
 				return
 			}
 		default:
 			t.Errorf("unexpected method %s", req.Method)
 		}
 		b, _ := json.Marshal(result)
-		fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":%s}`, req.ID, b)
+		_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%d,"result":%s}`, req.ID, b)
 	}))
 	t.Cleanup(srv.Close)
 	t.Setenv("EXAMPLE_ENDPOINT", srv.URL)
@@ -178,12 +176,12 @@ func TestQueryIntegrity(t *testing.T) {
 				a.Now = func() time.Time { return time.Now().Add(16 * time.Minute) }
 				want = 6
 			case "clock":
-				os.Chtimes(e.Meta.Raw, time.Now().Add(-time.Hour), time.Now().Add(-time.Hour))
+				requireNoError(t, os.Chtimes(e.Meta.Raw, time.Now().Add(-time.Hour), time.Now().Add(-time.Hour)))
 				want = 6
 			case "hash":
 				b, _ := os.ReadFile(e.Meta.Raw)
 				b = []byte(strings.Replace(string(b), "9007199254740993123456789", "9007199254740993123456788", 1))
-				os.WriteFile(e.Meta.Raw, b, 0600)
+				requireNoError(t, os.WriteFile(e.Meta.Raw, b, 0600))
 				want = 2
 			case "mismatch":
 				args[3] = "example-other"
@@ -196,21 +194,21 @@ func TestQueryIntegrity(t *testing.T) {
 			case "schema":
 				b, _ := os.ReadFile(a.ConfigPath)
 				var cfg Config
-				json.Unmarshal(b, &cfg)
+				requireNoError(t, json.Unmarshal(b, &cfg))
 				s := cfg.Servers["example-server"]
 				p := s.Tools["example_read"]
 				p.SchemaHash = strings.Repeat("a", 64)
 				s.Tools["example_read"] = p
 				b, _ = json.Marshal(cfg)
-				os.WriteFile(a.ConfigPath, b, 0600)
+				requireNoError(t, os.WriteFile(a.ConfigPath, b, 0600))
 				want = 5
 			case "permission":
-				os.Chmod(a.ConfigPath, 0666)
+				requireNoError(t, os.Chmod(a.ConfigPath, 0666))
 				want = 5
 			case "symlink":
 				p := e.Meta.Raw
-				os.Rename(p, p+"-other")
-				os.Symlink(p+"-other", p)
+				requireNoError(t, os.Rename(p, p+"-other"))
+				requireNoError(t, os.Symlink(p+"-other", p))
 				want = 2
 			}
 			before := *c
@@ -297,19 +295,19 @@ func TestStorageAndShape(t *testing.T) {
 	b, _ := fixture(t, "")
 	cfgData, _ := os.ReadFile(b.ConfigPath)
 	var cfg Config
-	json.Unmarshal(cfgData, &cfg)
-	os.WriteFile(cfg.RawDir, []byte("blocked"), 0600)
+	requireNoError(t, json.Unmarshal(cfgData, &cfg))
+	requireNoError(t, os.WriteFile(cfg.RawDir, []byte("blocked"), 0600))
 	run(t, b, callArgs(), 2)
 	c, _ := fixture(t, "shape")
 	first := run(t, c, callArgs(), 0)
 	var saved map[string]any
 	raw, _ := os.ReadFile(first.Meta.Raw)
-	json.Unmarshal(raw, &saved)
+	requireNoError(t, json.Unmarshal(raw, &saved))
 	shapeFiles, _ := filepath.Glob(filepath.Join(filepath.Dir(first.Meta.Raw), "shape-*.json"))
 	if len(shapeFiles) != 1 {
 		t.Fatal("shape baseline")
 	}
-	os.WriteFile(shapeFiles[0], []byte(`["items","next"]`), 0600)
+	requireNoError(t, os.WriteFile(shapeFiles[0], []byte(`["items","next"]`), 0600))
 	e = run(t, c, callArgs(), 2)
 	if e.Meta.Shape != "changed" {
 		t.Fatal("shape not detected")
@@ -347,7 +345,7 @@ func TestEnvelopeEmptyData(t *testing.T) {
 		t.Fatal(err)
 	}
 	var obj map[string]any
-	json.Unmarshal(b, &obj)
+	requireNoError(t, json.Unmarshal(b, &obj))
 	if _, ok := obj["data"]; !ok {
 		t.Fatal("successful empty stream must include data:[]")
 	}
@@ -364,13 +362,13 @@ func TestUnknownCompleteness(t *testing.T) {
 	a, _ := fixture(t, "")
 	b, _ := os.ReadFile(a.ConfigPath)
 	var cfg Config
-	json.Unmarshal(b, &cfg)
+	requireNoError(t, json.Unmarshal(b, &cfg))
 	s := cfg.Servers["example-server"]
 	p := s.Tools["example_read"]
 	p.Page = nil
 	s.Tools["example_read"] = p
 	b, _ = json.Marshal(cfg)
-	os.WriteFile(a.ConfigPath, b, 0600)
+	requireNoError(t, os.WriteFile(a.ConfigPath, b, 0600))
 	e := run(t, a, callArgs(), 4)
 	if e.Meta.Complete != "unknown" {
 		t.Fatal("completeness")
@@ -408,26 +406,26 @@ func TestMetricsAndPermissions(t *testing.T) {
 			if mode == "over-hour" {
 				b, _ := os.ReadFile(a.ConfigPath)
 				var c Config
-				json.Unmarshal(b, &c)
+				requireNoError(t, json.Unmarshal(b, &c))
 				c.MaxAge = "61m"
 				b, _ = json.Marshal(c)
-				os.WriteFile(a.ConfigPath, b, 0600)
+				requireNoError(t, os.WriteFile(a.ConfigPath, b, 0600))
 				run(t, a, callArgs(), 5)
 				return
 			}
 			e := run(t, a, callArgs(), 0)
 			switch mode {
 			case "root-mode":
-				os.Chmod(filepath.Dir(e.Meta.Raw), 0755)
+				requireNoError(t, os.Chmod(filepath.Dir(e.Meta.Raw), 0755))
 				run(t, a, queryArgs(e), 2)
 			case "root-link":
 				root := filepath.Dir(e.Meta.Raw)
-				os.Rename(root, root+"-other")
-				os.Symlink(root+"-other", root)
+				requireNoError(t, os.Rename(root, root+"-other"))
+				requireNoError(t, os.Symlink(root+"-other", root))
 				run(t, a, queryArgs(e), 2)
 			case "config-link":
-				os.Rename(a.ConfigPath, a.ConfigPath+"-other")
-				os.Symlink(a.ConfigPath+"-other", a.ConfigPath)
+				requireNoError(t, os.Rename(a.ConfigPath, a.ConfigPath+"-other"))
+				requireNoError(t, os.Symlink(a.ConfigPath+"-other", a.ConfigPath))
 				run(t, a, queryArgs(e), 5)
 			case "negative-age":
 				a.Now = func() time.Time { return e.Meta.FetchedAt.Add(-time.Second) }
@@ -456,21 +454,21 @@ func TestMetadataCorruption(t *testing.T) {
 	e := run(t, a, callArgs(), 4)
 	b, _ := os.ReadFile(e.Meta.Raw)
 	b = []byte(strings.Replace(string(b), `"complete":false`, `"complete":true`, 1))
-	os.WriteFile(e.Meta.Raw, b, 0600)
-	os.Chtimes(e.Meta.Raw, e.Meta.FetchedAt, e.Meta.FetchedAt)
+	requireNoError(t, os.WriteFile(e.Meta.Raw, b, 0600))
+	requireNoError(t, os.Chtimes(e.Meta.Raw, e.Meta.FetchedAt, e.Meta.FetchedAt))
 	run(t, a, queryArgs(e), 2)
 }
 func TestInitialCursorDenied(t *testing.T) {
 	a, calls := fixture(t, "")
 	b, _ := os.ReadFile(a.ConfigPath)
 	var cfg Config
-	json.Unmarshal(b, &cfg)
+	requireNoError(t, json.Unmarshal(b, &cfg))
 	s := cfg.Servers["example-server"]
 	p := s.Tools["example_read"]
 	p.Args["cursor"] = []any{"example-next"}
 	s.Tools["example_read"] = p
 	b, _ = json.Marshal(cfg)
-	os.WriteFile(a.ConfigPath, b, 0600)
+	requireNoError(t, os.WriteFile(a.ConfigPath, b, 0600))
 	args := callArgs()
 	args[4] = `{"limit":2,"cursor":"example-next"}`
 	run(t, a, args, 5)
@@ -488,12 +486,12 @@ func TestCleanupDoesNotDeleteUnrelatedFiles(t *testing.T) {
 	a, _ := fixture(t, "")
 	b, _ := os.ReadFile(a.ConfigPath)
 	var c Config
-	json.Unmarshal(b, &c)
-	os.Mkdir(c.RawDir, 0700)
+	requireNoError(t, json.Unmarshal(b, &c))
+	requireNoError(t, os.Mkdir(c.RawDir, 0700))
 	path := filepath.Join(c.RawDir, "example-unrelated.json")
-	os.WriteFile(path, []byte(`{"example":true}`), 0600)
+	requireNoError(t, os.WriteFile(path, []byte(`{"example":true}`), 0600))
 	old := time.Now().Add(-25 * time.Hour)
-	os.Chtimes(path, old, old)
+	requireNoError(t, os.Chtimes(path, old, old))
 	run(t, a, callArgs(), 2)
 	if _, e := os.Stat(path); e != nil {
 		t.Fatal("cleanup deleted unrelated file")

@@ -45,6 +45,7 @@ The config contains **names, not secrets**: endpoints and tokens are referenced 
     "example-server": {
       "endpoint_env": "EXAMPLE_ENDPOINT",
       "token_env": "EXAMPLE_TOKEN",
+      "allow_plain_http_hosts": [],
       "tools": {
         "example_read": {
           "schema_hash": "EXAMPLE-NOT-A-VALID-HASH",
@@ -66,7 +67,8 @@ The config contains **names, not secrets**: endpoints and tokens are referenced 
 - `servers.<name>.tools.<tool>.args` enumerates the **only argument values allowed**; unknown keys are rejected. `required` lists arguments that must be present.
 - `schema_hash` is the SHA-256 of the tool's `{name, inputSchema}` as canonical JSON, captured when you approve the tool. `mcpq` never registers or updates it automatically.
 - `page` (optional) declares how pagination works for a tool: where the items and the next-page cursor live (dot-separated paths), which arguments carry the limit and cursor, and the page cap. Only tools with a `page` declaration — or another explicit completeness proof in the response — can ever report `complete: true`; all others report `"unknown"`.
-- `max_age` caps how old a snapshot may be when re-queried (default `15m`, hard maximum `60m`).
+- `allow_plain_http_hosts` is a per-server array of exact hostnames (default empty) allowed to use plain HTTP in addition to loopback. Wildcards, URL syntax, and ports are rejected. Matching is literal and case-sensitive; it does not match subdomains or IP addresses obtained by DNS resolution. Only this permission-checked config can grant the exception; there is no flag or environment override. Approving a host permits credentials and response data to travel without TLS.
+- `max_age` caps how old a snapshot or external baseline may be when queried or compared (default `15m`, hard maximum `60m`).
 - `deadline` is the overall time budget per invocation (default `30s`, maximum `5m`).
 - `raw_dir` is where snapshots and diff logs are stored (see below).
 - `shadow_jq` is the jq expression `compare` applies to both sides before comparing (default `.`, exact comparison).
@@ -92,6 +94,15 @@ mcpq tools example-server
 
 # Compare two stored snapshots (shadow/differential checking).
 mcpq compare example-server example_read --raw-id <id-a> --baseline-id <id-b>
+
+# Compare with a tools/call result obtained outside mcpq.
+mcpq compare example-server example_read --raw-id <id-a> \
+  --baseline-file /example/baseline.json \
+  --baseline-fetched-at 2026-01-01T00:00:00Z
+
+# Explicitly accept a reviewed change to the top-level keys.
+mcpq call example-server example_read --args '{"limit":2}' \
+  --expect '.items | type == "array"' --jq '.items[]' --accept-shape-change
 ```
 
 Flags:
@@ -102,7 +113,12 @@ Flags:
 | `--args JSON` | `call` | Tool arguments. Must match the allowlist exactly. |
 | `--jq EXPR` | `call`, `query` | jq filter applied to the result. The output stream becomes `data`. A `null` result is an error (code 2). |
 | `--max-bytes N` | `call`, `query` | Cap on the filtered output. Whole results that don't fit are dropped and the result is marked incomplete (code 4). |
-| `--max-age DURATION` | `query` | Refuse snapshots older than this. May not exceed the configured cap (code 1 if it does). |
+| `--max-age DURATION` | `query`, `compare` | Refuse snapshots or baselines older than this. May not exceed the configured cap (code 1 if it does). |
+| `--accept-shape-change` | `call` | Update the fingerprint after a key change, report `meta.shape: "changed"`, `shape_added`, and `shape_removed`, and continue other checks. |
+| `--raw-id ID` | `compare` | Required stored snapshot to compare. |
+| `--baseline-id ID` | `compare` | Stored comparison baseline; mutually exclusive with `--baseline-file`. |
+| `--baseline-file PATH` | `compare` | External tools/call result JSON. Requires `--baseline-fetched-at`. |
+| `--baseline-fetched-at RFC3339` | `compare` | Caller-declared fetch time for the external file only. No inferred timestamp. |
 | `--allow-partial` | `call`, `query` | Show `data` even when the result is incomplete (exit code stays 4). |
 
 When scripting, use `set -o pipefail` and do not discard exit codes with `|| true` or `| head` — a non-zero code is the tool's main safety signal.
@@ -138,7 +154,9 @@ When several apply, the highest priority wins: `1 > 5 > 3 > 2 > 6 > 4`. Codes 1 
 
 ## Snapshots
 
-Every successful or incomplete `call` stores its raw response under `raw_dir`:
+Every successful or incomplete `call` stores its raw response under `raw_dir`. If a result has been received but then rejected (for example by `--expect`, shape, page, or jq checks), the received pages are also saved with top-level `status: "rejected"` and `reason`. The error envelope includes `meta.raw` and `meta.raw_id` when storage succeeds. `query` and `compare` refuse rejected snapshots with code 2; inspect the raw file directly to investigate. A connection/authentication/timeout failure before any tools/call result leaves nothing to save. If a later page fails, earlier received results are retained as rejected, preserving the original failure code.
+
+Storage rules:
 
 - The directory must be owned by you and have mode `0700`; files are `0600`, published atomically, and symlinks are refused.
 - A snapshot records the server, tool, args, fetch time, completeness, and integrity hashes alongside the response pages.
@@ -146,6 +164,12 @@ Every successful or incomplete `call` stores its raw response under `raw_dir`:
 - Snapshots and diff logs are deleted 24 hours after creation, at the start of the next invocation. There is no background daemon.
 
 `compare` takes two snapshots of the same server/tool/args, checks freshness and completeness on both sides, compares them (exactly, or through `shadow_jq`), and writes a hash-only diff log under `raw_dir` — timestamps, both sides' hashes, the comparison policy hash, and the verdict. Response bodies are never copied into the log.
+
+An external baseline file must contain one tools/call **result object**, with `structuredContent` or `content`, rather than a JSON-RPC wrapper or an mcpq envelope. Both forms use the same target selection and `shadow_jq` normalization as snapshots. The file must be regular, owned by the current user, have no symlinks anywhere in its path, and not be writable by group or others. Input is limited to 8 MiB. Invalid files exit with code 2; a future timestamp or one older than the effective max-age exits with code 6. The default compare max-age is the configured cap; an explicit `--max-age` may only lower it.
+
+The caller asserts that an external baseline came from the same server/tool/arguments and that its declared time is correct; these facts cannot be authenticated from the result JSON. For a paginated tool the external result must satisfy the configured items/next paths and terminal-page completeness rule: no next cursor and fewer items than the requested limit. A nonterminal or full page exits with code 4. A result from a tool without pagination is treated as caller-declared complete on the external side; the stored side must still independently be complete.
+
+Response fingerprints contain **only the top-level keys** of the selected/merged response. Tools with optional keys may stop frequently. Without `--accept-shape-change`, changed keys exit with code 2 and the fingerprint stays unchanged. The flag is supported only by `call`; it does not bypass assertions, pagination, or jq checks. An accepted change writes a private diff log referenced by `meta.diff_log`, containing old/new key sets and added/removed keys, never response values. Key names themselves are recorded. The fingerprint is replaced atomically and retained across the 24-hour cleanup; the diff log expires like other logs. A later rejection does not roll back an explicitly accepted fingerprint change.
 
 ## Safety model
 
@@ -155,7 +179,8 @@ Data returned by a server is untrusted input: treat `data` as external content, 
 
 ## Scope and status
 
-- Protocol: MCP Streamable HTTP, version `2025-06-18`, POST with JSON or SSE responses. Plain HTTP is accepted for loopback only; anything else must be HTTPS. Redirects are refused; there are no automatic retries or reconnects.
+- Protocol: MCP Streamable HTTP, version `2025-06-18`, POST with JSON or SSE responses. Plain HTTP is accepted for loopback and explicitly configured `allow_plain_http_hosts`; other hosts require HTTPS. Redirects are refused; there are no automatic retries or reconnects.
+- Snapshots: explicit shape acceptance, external shadow baselines, and retained rejected results are supported. Rejected snapshots cannot be reused by query or compare.
 - Not included: stdio transport, write operations of any kind, batch mode, credential recovery.
 - Resource limits: 8 MiB per response, up to 100 pages per call, 1 MiB of filtered output, 100,000 jq results.
 - **Status:** verified only against local mock MCP servers (HTTP/SSE) in the test suite. It has not yet been validated against real MCP servers, and no performance claims are made.
@@ -163,8 +188,9 @@ Data returned by a server is untrusted input: treat `data` as external content, 
 ## Development
 
 ```sh
-go test ./...   # mock-server tests only; no network access to real services
+go test -race ./...   # mock-server tests only; no network access to real services
 go vet ./...
+golangci-lint run ./...
 ```
 
 Code is formatted with gofmt/goimports. The only runtime dependency is [gojq](https://github.com/itchyny/gojq).

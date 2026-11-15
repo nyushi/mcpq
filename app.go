@@ -19,6 +19,9 @@ type options struct {
 	maxBytes                            int
 	maxAge                              time.Duration
 	ageExplicit                         bool
+	baselineFile                        string
+	baselineAt                          time.Time
+	acceptShape                         bool
 }
 
 func parse(args []string) (options, error) {
@@ -59,6 +62,13 @@ func parse(args []string) (options, error) {
 			return o, fail(1, "duplicate_flag")
 		}
 		seen[k] = true
+		if k == "--accept-shape-change" {
+			if o.command != "call" {
+				return o, fail(1, "flag_not_supported")
+			}
+			o.acceptShape = true
+			continue
+		}
 		if k == "--allow-partial" {
 			if o.command != "call" && o.command != "query" {
 				return o, fail(1, "flag_not_supported")
@@ -106,7 +116,7 @@ func parse(args []string) (options, error) {
 			}
 			o.tool = v
 		case "--max-age":
-			if o.command != "query" {
+			if o.command != "query" && o.command != "compare" {
 				return o, fail(1, "flag_not_supported")
 			}
 			d, e := time.ParseDuration(v)
@@ -129,6 +139,20 @@ func parse(args []string) (options, error) {
 				return o, fail(1, "raw_id_invalid")
 			}
 			o.id = v
+		case "--baseline-file":
+			if o.command != "compare" || v == "" {
+				return o, fail(1, "baseline_file_invalid")
+			}
+			o.baselineFile = v
+		case "--baseline-fetched-at":
+			if o.command != "compare" {
+				return o, fail(1, "flag_not_supported")
+			}
+			at, err := time.Parse(time.RFC3339Nano, v)
+			if err != nil || at.IsZero() {
+				return o, fail(1, "baseline_time_invalid")
+			}
+			o.baselineAt = at
 		case "--baseline-id":
 			if o.command != "compare" || !validID.MatchString(v) {
 				return o, fail(1, "baseline_id_invalid")
@@ -141,8 +165,13 @@ func parse(args []string) (options, error) {
 	if o.server == "" || (o.command != "tools" && o.tool == "") {
 		return o, fail(1, "target_required")
 	}
-	if o.command == "compare" && (o.id == "" || o.baseline == "") {
-		return o, fail(1, "compare_ids_required")
+	if o.command == "compare" {
+		if o.id == "" || (o.baseline == "") == (o.baselineFile == "") {
+			return o, fail(1, "compare_baseline_required")
+		}
+		if (o.baselineFile != "") != !o.baselineAt.IsZero() {
+			return o, fail(1, "baseline_time_required")
+		}
 	}
 	if o.command == "call" || o.command == "query" {
 		if expect == "" {
@@ -178,7 +207,7 @@ func (a *App) Run(args []string) (env Envelope, code int) {
 			env.Meta.Reason = brief(err)
 		}
 		env.Meta.Code = c
-		if c != 0 && !(c == 4 && o.allow) {
+		if c != 0 && (c != 4 || !o.allow) {
 			env.Data = nil
 		}
 		return env, c
@@ -194,11 +223,11 @@ func (a *App) Run(args []string) (env Envelope, code int) {
 	if e != nil {
 		return finish(e)
 	}
-	if o.command == "query" {
+	if o.command == "query" || o.command == "compare" {
 		upper := duration(c.MaxAge)
 		if !o.ageExplicit {
 			o.maxAge = upper
-			if o.maxAge > 15*time.Minute {
+			if o.command == "query" && o.maxAge > 15*time.Minute {
 				o.maxAge = 15 * time.Minute
 			}
 		}
@@ -214,12 +243,13 @@ func (a *App) Run(args []string) (env Envelope, code int) {
 		return finish(fail(5, "server_denied"))
 	}
 	var p Policy
-	if o.command == "call" {
+	switch o.command {
+	case "call":
 		s, p, e = authorize(c, o.server, o.tool, o.args, false)
 		if e != nil {
 			return finish(e)
 		}
-	} else if o.command == "compare" {
+	case "compare":
 		var ok bool
 		p, ok = s.Tools[o.tool]
 		if !ok || dangerous(o.tool) {
@@ -276,15 +306,12 @@ func (a *App) Run(args []string) (env Envelope, code int) {
 		if !ok || hashValue(t) != p.SchemaHash {
 			return finish(fail(5, "schema_changed"))
 		}
-		snapshot, e := a.fetch(ctx, c, cl, o, p)
+		snapshot, data, e := a.fetch(ctx, c, cl, o, p)
 		env.Meta = snapshot.Meta
 		if e != nil {
 			return finish(e)
 		}
-		env.Data, e = filter(ctx, o, p, snapshot.Pages, &env.Meta)
-		if e != nil {
-			return finish(e)
-		}
+		env.Data = data
 		return finish(partial(env.Meta))
 	case "query":
 		snap, e := a.checkSnapshot(ctx, c, o.id, o.server, o.tool, o.maxAge)
@@ -303,7 +330,7 @@ func (a *App) Run(args []string) (env Envelope, code int) {
 		if e != nil {
 			return finish(e)
 		}
-		if e = shape(ctx, c, &env.Meta, v); e != nil {
+		if e = shape(ctx, c, &env.Meta, v, false); e != nil {
 			return finish(e)
 		}
 		env.Data, e = filter(ctx, o, p, snap.Pages, &env.Meta)
@@ -312,8 +339,14 @@ func (a *App) Run(args []string) (env Envelope, code int) {
 		}
 		return finish(prefer(freshness, partial(env.Meta)))
 	case "compare":
-		left, le := a.checkSnapshot(ctx, c, o.id, o.server, o.tool, duration(c.MaxAge))
-		right, re := a.checkSnapshot(ctx, c, o.baseline, o.server, o.tool, duration(c.MaxAge))
+		left, le := a.checkSnapshot(ctx, c, o.id, o.server, o.tool, o.maxAge)
+		var right Snapshot
+		var re error
+		if o.baselineFile != "" {
+			right, re = a.readBaseline(ctx, o, p, left.Meta)
+		} else {
+			right, re = a.checkSnapshot(ctx, c, o.baseline, o.server, o.tool, o.maxAge)
+		}
 		env.Meta = left.Meta
 		if le != nil || re != nil {
 			return finish(prefer(le, re))
@@ -326,7 +359,7 @@ func (a *App) Run(args []string) (env Envelope, code int) {
 		}
 		lp, _ := merged(left.Pages, p)
 		rp, _ := merged(right.Pages, p)
-		if e := shape(ctx, c, &env.Meta, lp); e != nil {
+		if e := shape(ctx, c, &env.Meta, lp, false); e != nil {
 			return finish(e)
 		}
 		if hashValue(keys(lp)) != hashValue(keys(rp)) {
@@ -420,12 +453,25 @@ func filter(ctx context.Context, o options, p Policy, pages []any, m *Meta) ([]a
 	}
 	return out, nil
 }
-func (a *App) fetch(ctx context.Context, c Config, cl *client, o options, p Policy) (snap Snapshot, err error) {
+func (a *App) fetch(ctx context.Context, c Config, cl *client, o options, p Policy) (snap Snapshot, data []any, err error) {
 	snap.Meta = Meta{Server: o.server, Tool: o.tool, Args: o.args, SchemaHash: p.SchemaHash, Complete: "unknown"}
 	defer func() {
 		snap.Meta.HTTPRequests = cl.requests
 		snap.Meta.ToolCalls = cl.calls
 		snap.Meta.ResponseBytes = cl.bytes
+		if err != nil && len(snap.Pages) > 0 {
+			snap.Status = "rejected"
+			snap.Reason = brief(err)
+			snap.Meta.Reason = brief(err)
+			snap.Meta.Code = errCode(err)
+			// Preserve received results even when the network deadline has expired.
+			if saveErr := a.save(context.WithoutCancel(ctx), c, &snap); saveErr != nil {
+				snap.Meta.Raw = ""
+				snap.Meta.RawID = ""
+				snap.Meta.RawSHA256 = ""
+				err = prefer(err, saveErr)
+			}
+		}
 	}()
 	args := map[string]any{}
 	for k, v := range o.args {
@@ -438,21 +484,21 @@ func (a *App) fetch(ctx context.Context, c Config, cl *client, o options, p Poli
 	seen := map[string]bool{}
 	for i := 0; i < max; i++ {
 		if _, _, e := authorize(c, o.server, o.tool, args, i > 0); e != nil {
-			return snap, e
+			return snap, nil, e
 		}
 		v, e := cl.rpc(ctx, "tools/call", map[string]any{"name": o.tool, "arguments": args})
 		if e != nil {
-			return snap, e
-		}
-		vtarget, blocks, e := target(v)
-		if e != nil {
-			return snap, e
-		}
-		if e = expectOK(ctx, o.expect, vtarget); e != nil {
-			return snap, e
+			return snap, nil, e
 		}
 		snap.Pages = append(snap.Pages, v)
+		vtarget, blocks, e := target(v)
 		snap.Meta.ContentBlocks += blocks
+		if e != nil {
+			return snap, nil, e
+		}
+		if e = expectOK(ctx, o.expect, vtarget); e != nil {
+			return snap, nil, e
+		}
 		if p.Page == nil {
 			break
 		}
@@ -460,20 +506,20 @@ func (a *App) fetch(ctx context.Context, c Config, cl *client, o options, p Poli
 		items, has := getPath(vtarget, page.Items)
 		arr, ok := items.([]any)
 		if !has || !ok {
-			return snap, fail(2, "page_items")
+			return snap, nil, fail(2, "page_items")
 		}
 		next, has := getPath(vtarget, page.Next)
 		if !has {
-			return snap, fail(2, "page_next_missing")
+			return snap, nil, fail(2, "page_next_missing")
 		}
 		if next == nil || next == "" {
 			limit, ok := args[page.LimitArg].(json.Number)
 			if !ok {
-				return snap, fail(2, "page_limit")
+				return snap, nil, fail(2, "page_limit")
 			}
 			n, e := strconv.Atoi(limit.String())
 			if e != nil || n < 1 {
-				return snap, fail(2, "page_limit")
+				return snap, nil, fail(2, "page_limit")
 			}
 			snap.Meta.Complete = "true"
 			if len(arr) >= n {
@@ -483,7 +529,7 @@ func (a *App) fetch(ctx context.Context, c Config, cl *client, o options, p Poli
 		}
 		cursor, ok := next.(string)
 		if !ok || len(cursor) > 4096 {
-			return snap, fail(2, "page_cursor")
+			return snap, nil, fail(2, "page_cursor")
 		}
 		snap.Meta.Complete = "false"
 		if seen[cursor] {
@@ -494,27 +540,27 @@ func (a *App) fetch(ctx context.Context, c Config, cl *client, o options, p Poli
 	}
 	v, e := merged(snap.Pages, p)
 	if e != nil {
-		return snap, e
+		return snap, nil, e
 	}
 	if e = expectOK(ctx, o.expect, v); e != nil {
-		return snap, e
+		return snap, nil, e
 	}
-	if e = shape(ctx, c, &snap.Meta, v); e != nil {
-		return snap, e
+	if e = shape(ctx, c, &snap.Meta, v, o.acceptShape); e != nil {
+		return snap, nil, e
 	}
 	snap.Meta.HTTPRequests = cl.requests
 	snap.Meta.ToolCalls = cl.calls
 	snap.Meta.ResponseBytes = cl.bytes
 	// Budget completeness is persisted so query cannot turn a partial call into success.
 	temp := snap.Meta
-	if _, e = filter(ctx, o, p, snap.Pages, &temp); e != nil {
-		return snap, e
+	if data, e = filter(ctx, o, p, snap.Pages, &temp); e != nil {
+		return snap, nil, e
 	}
-	snap.Meta.Complete = temp.Complete
+	snap.Meta = temp
 	if e = a.save(ctx, c, &snap); e != nil {
-		return snap, e
+		return snap, nil, e
 	}
-	return snap, nil
+	return snap, data, nil
 }
 
 // Prevent accidental exposure of transport/config errors in the CLI.

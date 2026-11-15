@@ -7,6 +7,7 @@
     "example-server": {
       "endpoint_env": "EXAMPLE_ENDPOINT",
       "token_env": "EXAMPLE_TOKEN",
+      "allow_plain_http_hosts": [],
       "tools": {
         "example_read": {
           "schema_hash": "EXAMPLE-NOT-A-VALID-HASH",

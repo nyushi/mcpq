@@ -36,11 +36,18 @@ type Server struct {
 	Tools               map[string]Policy `json:"tools"`
 }
 type Policy struct {
-	SchemaHash string           `json:"schema_hash"`
-	Args       map[string][]any `json:"args"`
-	Required   []string         `json:"required"`
-	Page       *Page            `json:"page,omitempty"`
+	SchemaHash   string              `json:"schema_hash"`
+	Args         map[string][]any    `json:"args"`
+	Required     []string            `json:"required"`
+	Page         *Page               `json:"page,omitempty"`
+	Completeness *CompletenessPolicy `json:"completeness,omitempty"`
 }
+type CompletenessPolicy struct {
+	Mode     string `json:"mode"`
+	Items    string `json:"items,omitempty"`
+	LimitArg string `json:"limit_arg,omitempty"`
+}
+
 type Page struct {
 	Items     string `json:"items"`
 	Next      string `json:"next"`
@@ -323,6 +330,31 @@ func loadConfig(path string) (Config, error) {
 		for name, p := range s.Tools {
 			if dangerous(name) || !validHash.MatchString(p.SchemaHash) {
 				return c, fail(5, "config_policy")
+			}
+			if d := p.Completeness; d != nil {
+				if p.Page != nil {
+					return c, fail(5, "config_completeness")
+				}
+				switch d.Mode {
+				case "single":
+					if d.Items != "" || d.LimitArg != "" {
+						return c, fail(5, "config_completeness")
+					}
+				case "limit":
+					if d.Items == "" || d.LimitArg == "" || len(p.Args[d.LimitArg]) == 0 {
+						return c, fail(5, "config_completeness")
+					}
+					if _, err := compile(d.Items); err != nil {
+						return c, fail(5, "config_completeness")
+					}
+					for _, v := range p.Args[d.LimitArg] {
+						if _, ok := completenessLimit(v); !ok {
+							return c, fail(5, "config_completeness_limit")
+						}
+					}
+				default:
+					return c, fail(5, "config_completeness")
+				}
 			}
 			if p.Page != nil {
 				pg := p.Page

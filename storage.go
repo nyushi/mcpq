@@ -285,7 +285,7 @@ func keyDifference(left, right []string) []string {
 // External files contain a single tools/call result. Target and arguments are
 // asserted by the caller; no provenance is inferred from the JSON document.
 func (a *App) readBaseline(ctx context.Context, o options, p Policy, left Meta) (Snapshot, error) {
-	s := Snapshot{Meta: Meta{Server: o.server, Tool: o.tool, Args: left.Args, FetchedAt: o.baselineAt, Complete: "true"}}
+	s := Snapshot{Meta: Meta{Server: o.server, Tool: o.tool, Args: left.Args, FetchedAt: o.baselineAt, Complete: "unknown"}}
 	b, st, e := readSafe(o.baselineFile, receiveLimit)
 	if e != nil {
 		return s, e
@@ -312,7 +312,9 @@ func (a *App) readBaseline(ctx context.Context, o options, p Policy, left Meta) 
 	}
 	s.Pages = []any{v}
 	s.Meta.ContentBlocks = blocks
+	s.Meta.Complete = declaredCompleteness(ctx, p, value, left.Args)
 	if p.Page != nil {
+		s.Meta.Complete = "true"
 		items, has := getPath(value, p.Page.Items)
 		arr, ok := items.([]any)
 		if !has || !ok {

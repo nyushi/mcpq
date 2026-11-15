@@ -17,6 +17,11 @@
             "items": "items", "next": "next",
             "limit_arg": "limit", "cursor_arg": "cursor", "max_pages": 20
           }
+        },
+        "example_status": {
+          "schema_hash": "EXAMPLE-NOT-A-VALID-HASH",
+          "args": {},
+          "completeness": {"mode": "single"}
         }
       }
     }

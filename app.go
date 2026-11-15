@@ -500,6 +500,7 @@ func (a *App) fetch(ctx context.Context, c Config, cl *client, o options, p Poli
 			return snap, nil, e
 		}
 		if p.Page == nil {
+			snap.Meta.Complete = declaredCompleteness(ctx, p, vtarget, o.args)
 			break
 		}
 		page := p.Page

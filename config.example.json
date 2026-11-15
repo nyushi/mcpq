@@ -1,0 +1,23 @@
+{
+  "raw_dir": "/example/mcpq/raw",
+  "deadline": "30s",
+  "max_age": "15m",
+  "shadow_jq": ".",
+  "servers": {
+    "example-server": {
+      "endpoint_env": "EXAMPLE_ENDPOINT",
+      "token_env": "EXAMPLE_TOKEN",
+      "tools": {
+        "example_read": {
+          "schema_hash": "EXAMPLE-NOT-A-VALID-HASH",
+          "args": {"limit": [2]},
+          "required": ["limit"],
+          "page": {
+            "items": "items", "next": "next",
+            "limit_arg": "limit", "cursor_arg": "cursor", "max_pages": 20
+          }
+        }
+      }
+    }
+  }
+}

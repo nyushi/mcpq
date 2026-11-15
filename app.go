@@ -22,6 +22,7 @@ type options struct {
 	baselineFile                        string
 	baselineAt                          time.Time
 	acceptShape                         bool
+	alertObjects                        bool
 }
 
 func parse(args []string) (options, error) {
@@ -198,6 +199,9 @@ func (a *App) Run(args []string) (env Envelope, code int) {
 			code = 2
 		}
 	}()
+	if len(args) > 0 && args[0] == "batch" {
+		return a.runBatch(args[1:])
+	}
 	o, e := parse(args)
 	env.Meta = Meta{Server: o.server, Tool: o.tool, Args: o.args}
 	finish := func(err error) (Envelope, int) {
@@ -276,17 +280,11 @@ func (a *App) Run(args []string) (env Envelope, code int) {
 			env.Meta.ToolCalls = cl.calls
 			env.Meta.ResponseBytes = cl.bytes
 		}()
-		if e = cl.init(ctx); e != nil {
-			env.Meta.HTTPRequests = cl.requests
-			env.Meta.ResponseBytes = cl.bytes
-			return finish(e)
-		}
-		ts, e := cl.tools(ctx)
+		ts, e := cl.catalog(ctx)
 		if e != nil {
-			env.Meta.HTTPRequests = cl.requests
-			env.Meta.ResponseBytes = cl.bytes
 			return finish(e)
 		}
+
 		if o.command == "tools" {
 			names := []string{}
 			for n := range s.Tools {
@@ -305,9 +303,8 @@ func (a *App) Run(args []string) (env Envelope, code int) {
 			env.Meta.ResponseBytes = cl.bytes
 			return finish(nil)
 		}
-		t, ok := ts[o.tool]
-		if !ok || hashValue(t) != p.SchemaHash {
-			return finish(fail(5, "schema_changed"))
+		if e := checkToolSchema(ts, o.tool, p); e != nil {
+			return finish(e)
 		}
 		snapshot, data, e := a.fetch(ctx, c, cl, o, p)
 		env.Meta = snapshot.Meta
@@ -440,6 +437,11 @@ func filter(ctx context.Context, o options, p Policy, pages []any, m *Meta) ([]a
 	out := []any{}
 	size := 2
 	for _, value := range values {
+		if o.alertObjects {
+			if _, ok := value.(map[string]any); !ok {
+				return nil, fail(2, "alert_object_required")
+			}
+		}
 		if value == nil {
 			return nil, fail(2, "jq_null")
 		}

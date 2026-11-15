@@ -16,6 +16,10 @@ import (
 )
 
 type client struct {
+	catalogStarted bool
+	catalogTools   map[string]any
+	catalogErr     error
+
 	http     *http.Client
 	server   Server
 	endpoint string
@@ -287,4 +291,23 @@ func plainHostAllowed(s Server, host string) bool {
 		}
 	}
 	return false
+}
+
+// catalog initializes and discovers tools once, including failed attempts.
+func (c *client) catalog(ctx context.Context) (map[string]any, error) {
+	if !c.catalogStarted {
+		c.catalogStarted = true
+		c.catalogErr = c.init(ctx)
+		if c.catalogErr == nil {
+			c.catalogTools, c.catalogErr = c.tools(ctx)
+		}
+	}
+	return c.catalogTools, c.catalogErr
+}
+func checkToolSchema(tools map[string]any, name string, p Policy) error {
+	t, ok := tools[name]
+	if !ok || hashValue(t) != p.SchemaHash {
+		return fail(5, "schema_changed")
+	}
+	return nil
 }

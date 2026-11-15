@@ -217,3 +217,35 @@ A tool policy may declare the top-level keys of the selected/merged response (th
 `required` and `optional` are arrays of strings. Keys must be unique within and across both arrays; invalid declarations exit with code 5. Either array may be omitted or empty, including both. A non-object response has an empty key set. Missing required keys exit with code 2 (`shape_changed`) and appear in `meta.shape_removed`; undeclared keys similarly appear in `meta.shape_added`. Optional keys may appear and disappear freely. Successful validation reports `meta.shape: "declared"`.
 
 Declared tools use the same fixed checks in `call`, `query`, and `compare`, including saved snapshots and external baselines. They neither read nor write fingerprint files. `--accept-shape-change` is rejected with code 1 before networking: edit the declaration instead. Without `shape`, existing fingerprint behavior is unchanged. When both declaration arrays are empty, only an empty key set passes. Comparison still compares values after shape validation, so allowed optional-key differences can produce `compare_difference` unless the configured shadow selection excludes them.
+
+### batch
+
+`mcpq batch <spec.json> [--allow-partial]` runs 1–20 steps in order with
+one shared deadline and one initialized session and tool catalog per server.
+Each step uses the existing call permissions, schema, expect, completeness,
+shape, and raw storage checks. All permissions are checked before networking.
+The spec is a regular file owned by the current user, without symlinks or
+group/other write permission, at most 1 MiB. Unknown top-level/step keys and
+duplicate IDs are rejected. IDs contain only letters, digits, and hyphens.
+
+```json
+{"name":"example-check","vars":{"threshold":100},"steps":[{"id":"slow-items","server":"example-server","tool":"example_read","args":{"limit":50},"expect":".items | type == \"array\"","alert":".items[] | select(.value > $vars.threshold) | {name,value}"}]}
+```
+
+The alert expression must emit objects only; an empty stream means no alerts.
+Missing variable fields fail the step. `meta` includes `spec`, `spec_sha256`,
+`verdict`, per-step `steps` (id, code, complete, matched, raw_id, fetched_at),
+and total tool_calls, http_requests, response_bytes, and code.
+`data` is an array of `{"step":"slow-items","alert":{"name":"example","value":120}}`.
+`query` can re-filter a saved raw response using its raw_id.
+
+| Exit code | Meaning |
+| --- | --- |
+| 7 | Alerts found in otherwise successful, complete steps |
+
+`clear` and exit 0 require every step to succeed with complete true and zero
+alerts. `alert` uses exit 7 and includes data. All other results use `error`;
+precedence is 1 > 5 > 3 > 2 > 6 > 4 > 7. Failure suppresses data, except
+`--allow-partial` with overall code 4 includes alerts from code-4 steps only.
+Steps continue after failure. Batch stores no previous values or comparison
+state; callers retain prior results themselves.

@@ -46,6 +46,8 @@ type CompletenessPolicy struct {
 	Mode     string `json:"mode"`
 	Items    string `json:"items,omitempty"`
 	LimitArg string `json:"limit_arg,omitempty"`
+	Total    string `json:"total,omitempty"`
+	HasMore  string `json:"has_more,omitempty"`
 }
 
 type Page struct {
@@ -337,11 +339,11 @@ func loadConfig(path string) (Config, error) {
 				}
 				switch d.Mode {
 				case "single":
-					if d.Items != "" || d.LimitArg != "" {
+					if d.Items != "" || d.LimitArg != "" || d.Total != "" || d.HasMore != "" {
 						return c, fail(5, "config_completeness")
 					}
 				case "limit":
-					if d.Items == "" || d.LimitArg == "" || len(p.Args[d.LimitArg]) == 0 {
+					if d.Items == "" || d.LimitArg == "" || len(p.Args[d.LimitArg]) == 0 || d.Total != "" || d.HasMore != "" {
 						return c, fail(5, "config_completeness")
 					}
 					if _, err := compile(d.Items); err != nil {
@@ -350,6 +352,17 @@ func loadConfig(path string) (Config, error) {
 					for _, v := range p.Args[d.LimitArg] {
 						if _, ok := completenessLimit(v); !ok {
 							return c, fail(5, "config_completeness_limit")
+						}
+					}
+				case "signal":
+					if d.LimitArg != "" || (d.Total == "" && d.HasMore == "") || (d.Total != "" && d.Items == "") {
+						return c, fail(5, "config_completeness")
+					}
+					for _, path := range []string{d.Items, d.Total, d.HasMore} {
+						if path != "" {
+							if _, err := compile(path); err != nil {
+								return c, fail(5, "config_completeness")
+							}
 						}
 					}
 				default:

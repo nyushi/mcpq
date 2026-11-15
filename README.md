@@ -1,54 +1,174 @@
 # mcpq
 
-MCP の読取り結果を取得し、必須の形の表明と jq で絞る段階1の CLI。実機適合・効果・運用受入れは未確認。接続テストはローカル HTTP/SSE モックだけを使う。
+`mcpq` is a read-only CLI that calls an MCP (Model Context Protocol) server and returns only the parts of the response you asked for, filtered with jq.
 
-## インターフェース
+It is built for agent/LLM workflows, where pasting raw MCP responses into the context is expensive and error-prone. `mcpq` is **fail-closed**: when anything is unexpected — a changed response shape, a truncated page, an expired snapshot, a schema that no longer matches the allowlist — it stops with a non-zero exit code instead of returning data that merely *looks* like a valid empty result.
 
+Key properties:
+
+- **Allowlist, deny by default.** Only servers, tools, and exact argument values listed in the config file may be called. Tool input schemas are pinned by SHA-256 hash; if a server's schema changes, calls stop.
+- **Mandatory shape assertion.** Every call must state what shape it expects (`--expect`). A jq mistake that evaluates to `null` is an error, not "no results".
+- **Completeness is explicit.** Results carry `complete: true / false / "unknown"`. Incomplete results exit with code 4 and only show data when you pass `--allow-partial`.
+- **Explicit snapshots, no implicit cache.** `call` always fetches fresh data and stores the raw response. Re-filtering stored data requires naming it (`query <raw_id>`), and stale snapshots are refused.
+- **One JSON envelope.** Stdout is always a single JSON object, `{"meta": {...}, "data": [...]}`, so metadata can never be stripped away from the data it describes.
+- **Integers keep their digits.** JSON numbers are never round-tripped through float64; IDs and timestamps larger than 2^53 survive intact.
+
+## Install
+
+```sh
+go install github.com/nyushi/mcpq@latest
 ```
-mcpq call SERVER TOOL --expect EXPR [--args JSON] [--jq EXPR] [--max-bytes N] [--allow-partial]
-mcpq query RAW_ID --server SERVER --tool TOOL --expect EXPR [--jq EXPR] [--max-age DURATION] [--max-bytes N] [--allow-partial]
-mcpq tools SERVER
-mcpq compare SERVER TOOL --raw-id RAW_ID --baseline-id BASELINE_ID
+
+Or build from source:
+
+```sh
+git clone https://github.com/nyushi/mcpq
+cd mcpq
+go build -o mcpq .
 ```
 
-これはインターフェース定義であり、実機の接続・確認手順ではない。実接続定義・実許可一覧・実ハッシュは含まない。`config.example.json` は架空かつ無効な例。固定設定パスは `types.go` の `defaultConfigPath` だけで定義し、CLI・環境から変更できない。設定パスと shadow 基準の採用はユーザー判断待ち。
+Requires Go 1.23 or later. Linux is assumed for the file-permission and ownership checks described below.
 
-## 結果の判断
+## Configuration
 
-stdout は JSON オブジェクト1個。`meta` と、表示可能な場合の `data`（jq 出力ストリームを配列化）を返す。空ストリームは `data:[]`、null 出力は2。expect は同じ入力への評価が厳密に true 1件の場合のみ合格。structuredContent を優先し、無ければ text の JSON、複数なら配列、JSON でない text が混じれば文字列配列を入力とする。
+`mcpq` reads a single config file at a **fixed path** — `/etc/mcpq/config.json`. The path cannot be changed by a flag or an environment variable; this is deliberate, so that the agent using the tool cannot widen its own permissions. The file must be a regular file owned by you or an administrator, must not be a symlink, and must not be writable by group or others, or `mcpq` refuses to start (exit code 5).
 
-|コード|意味|
+The config contains **names, not secrets**: endpoints and tokens are referenced by environment variable name and read from the environment on every invocation. Values never appear in the config, in logs, or in output.
+
+```json
+{
+  "raw_dir": "/example/mcpq/raw",
+  "deadline": "30s",
+  "max_age": "15m",
+  "shadow_jq": ".",
+  "servers": {
+    "example-server": {
+      "endpoint_env": "EXAMPLE_ENDPOINT",
+      "token_env": "EXAMPLE_TOKEN",
+      "tools": {
+        "example_read": {
+          "schema_hash": "EXAMPLE-NOT-A-VALID-HASH",
+          "args": {"limit": [2]},
+          "required": ["limit"],
+          "page": {
+            "items": "items", "next": "next",
+            "limit_arg": "limit", "cursor_arg": "cursor", "max_pages": 20
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+(This is `config.example.json` in this repository — fictional, and intentionally not usable as-is.)
+
+- `servers.<name>.tools.<tool>.args` enumerates the **only argument values allowed**; unknown keys are rejected. `required` lists arguments that must be present.
+- `schema_hash` is the SHA-256 of the tool's `{name, inputSchema}` as canonical JSON, captured when you approve the tool. `mcpq` never registers or updates it automatically.
+- `page` (optional) declares how pagination works for a tool: where the items and the next-page cursor live (dot-separated paths), which arguments carry the limit and cursor, and the page cap. Only tools with a `page` declaration — or another explicit completeness proof in the response — can ever report `complete: true`; all others report `"unknown"`.
+- `max_age` caps how old a snapshot may be when re-queried (default `15m`, hard maximum `60m`).
+- `deadline` is the overall time budget per invocation (default `30s`, maximum `5m`).
+- `raw_dir` is where snapshots and diff logs are stored (see below).
+- `shadow_jq` is the jq expression `compare` applies to both sides before comparing (default `.`, exact comparison).
+
+Set `MCPQ_DISABLE=1` to disable `mcpq` entirely; every command then exits with code 5, and callers should fall back to their pre-existing, already-authorized procedure.
+
+## Usage
+
+```sh
+# Fetch fresh data and filter it. --expect is required.
+mcpq call example-server example_read \
+  --expect 'type == "array"' \
+  --args '{"limit": 2}' \
+  --jq '.[] | {id, name}'
+
+# Re-filter a stored snapshot without contacting the server.
+# --server and --tool are required and must match the stored call.
+mcpq query 0123abcd... --server example-server --tool example_read \
+  --expect 'type == "array"' --jq '.[0]'
+
+# List the tools the config allows for a server (also verifies schemas).
+mcpq tools example-server
+
+# Compare two stored snapshots (shadow/differential checking).
+mcpq compare example-server example_read --raw-id <id-a> --baseline-id <id-b>
+```
+
+Flags:
+
+| Flag | Commands | Meaning |
+|---|---|---|
+| `--expect EXPR` | `call`, `query` | Required. jq expression evaluated against the (normalized) tool result; it must produce exactly one `true`, otherwise exit code 2. |
+| `--args JSON` | `call` | Tool arguments. Must match the allowlist exactly. |
+| `--jq EXPR` | `call`, `query` | jq filter applied to the result. The output stream becomes `data`. A `null` result is an error (code 2). |
+| `--max-bytes N` | `call`, `query` | Cap on the filtered output. Whole results that don't fit are dropped and the result is marked incomplete (code 4). |
+| `--max-age DURATION` | `query` | Refuse snapshots older than this. May not exceed the configured cap (code 1 if it does). |
+| `--allow-partial` | `call`, `query` | Show `data` even when the result is incomplete (exit code stays 4). |
+
+When scripting, use `set -o pipefail` and do not discard exit codes with `|| true` or `| head` — a non-zero code is the tool's main safety signal.
+
+## Output
+
+Stdout is one JSON object:
+
+```json
+{"meta": {"server": "example-server", "tool": "example_read",
+          "fetched_at": "2026-01-01T00:00:00Z", "complete": true,
+          "matched": 3, "raw_id": "…", "code": 0},
+ "data": [ … ]}
+```
+
+`meta` always includes the server, tool, args, fetch time, response size, call counts (`tool_calls`, `http_requests`, `response_bytes`), `matched` (number of jq results), `complete`, and — for stored responses — `raw_id`, the raw file path, and its SHA-256. When `matched` is 0, `meta` also carries the top-level keys of the raw response to help tell "empty" apart from "wrong shape". On any non-zero exit, `data` is omitted (except code 4 with `--allow-partial`).
+
+The jq input is the tool result's `structuredContent` when present; otherwise the `content` text blocks — parsed as JSON when possible, or passed as an array of strings when they are not JSON.
+
+## Exit codes
+
+| Code | Meaning |
 |---|---|
-|0|成功|
-|1|引数・式の構文・max-age 上限違反|
-|2|取得・形・保存・比較の失敗|
-|3|HTTP 401/403・認証値不足|
-|4|不完全（false/unknown）|
-|5|許可・設定・スキーマ・無効化|
-|6|保存結果の鮮度・時計不整合|
+| 0 | Success |
+| 1 | Usage error: bad syntax, invalid expression, `--max-age` over the configured cap |
+| 2 | Fetch/shape/storage/comparison failure: RPC error, `isError`, broken stream, failed `--expect`, corrupt or mismatched snapshot |
+| 3 | Authentication failure (HTTP 401/403, missing token). `mcpq` never tries to recover credentials |
+| 4 | Incomplete result (`complete` is `false` or `"unknown"`) |
+| 5 | Not allowed: config or permission problem, schema mismatch, or `MCPQ_DISABLE` is set |
+| 6 | Snapshot is stale, or its timestamps are inconsistent |
 
-優先順位は `1 > 5 > 3 > 2 > 6 > 4`。非0は data を出さず、4と `--allow-partial` の組合せだけ表示を許す（4は維持）。`meta.complete` は JSON の true/false または文字列 `"unknown"`。否定の結論には matched と complete を添えるか、既存の認可済み経路で確認する。`MCPQ_DISABLE=1` は全コマンドを拒否する。5を認可の迂回に使わない。パイプを使う側は `set -o pipefail` を設定し、`|| true` や `| head` で失敗を捨てない。
+When several apply, the highest priority wins: `1 > 5 > 3 > 2 > 6 > 4`. Codes 1 and 5 are decided before any network traffic (a schema mismatch is detected right after `tools/list`, before any tool call).
 
-許可は引数値の完全一致列挙、未知キーは拒否。必須引数を宣言できる。ページ用カーソルは初回入力を拒否し、設定内の規則でのみ生成する。ページの items/next はドット区切りオブジェクトパス。終端到達後も最終件数が limit に達する場合は保守的に4。shape の最上位キー基準は初回に記録し、変更は2、基準を自動更新しない。初回基準が正しいかは expect と管理者の責任。
+## Snapshots
 
-## 設定と保存
+Every successful or incomplete `call` stores its raw response under `raw_dir`:
 
-設定ファイルは symlink・group/other 書込みを拒否。自分または管理者が所有する通常ファイルのみ。設定中の endpoint_env/token_env は環境変数の**名前**であり、値を保存しない。許可ツールの `{name,inputSchema}` を JSON キー順で正規化した SHA256 を固定する。初期登録や変更承認を CLI が自動化する機能はない。readOnlyHint を認可には使わない。
+- The directory must be owned by you and have mode `0700`; files are `0600`, published atomically, and symlinks are refused.
+- A snapshot records the server, tool, args, fetch time, completeness, and integrity hashes alongside the response pages.
+- `query` re-checks all of it: the stored server/tool must match `--server`/`--tool`, hashes must verify, the file's mtime must agree with the recorded fetch time, and the snapshot must be within the max-age cap. `query` also re-checks the *current* allowlist and schema before reading.
+- Snapshots and diff logs are deleted 24 hours after creation, at the start of the next invocation. There is no background daemon.
 
-保存ルートは自分所有・0700、経路の symlink を拒否する。保存は0600の一時ファイルを完成させて排他的に公開する。保存形式は `meta` と元の `pages` と `integrity_sha256`。raw_sha256 は pages の正規化 JSON の SHA256、integrity_sha256 は自身を空文字にした保存文書全体の正規化 JSON の SHA256。保存時刻と mtime が一致しない・age が負なら6。期限の既定は15分、設定上限は最大60分、query 指定でその上限を超えれば1。query は保存 server/tool と現在の許可・schema を照合し、元の args と完全性を表示する。args の意味的な一致は利用者が判断する。認証先の失効はオフラインでは検出できない。
+`compare` takes two snapshots of the same server/tool/args, checks freshness and completeness on both sides, compares them (exactly, or through `shadow_jq`), and writes a hash-only diff log under `raw_dir` — timestamps, both sides' hashes, the comparison policy hash, and the verdict. Response bodies are never copied into the log.
 
-保存ルートに管理対象名以外のファイルが混在したら削除せず2で停止する。24時間経過した保存物と shadow ログを、次のコマンド開始時に削除する。実行停止中に時刻どおりの削除はしない。常駐の削除ジョブは含まない。shape 基準は本文を含まないキー集合で、24時間削除の対象外。同じユーザーによる悪意ある改ざん・競合を防ぐセキュリティ境界ではない。出力・引数・raw は機微な外部データを含み得る。バックアップ・同期・出力先の扱いは運用側が決める。保存先外へ raw を複製する機能はない。
+## Safety model
 
-## shadow と測定
+The threat model is **mistakes, not malice**: `mcpq` protects against an agent (or a human) accidentally trusting a wrong, stale, or partial result, and against bugs in the tool itself. Hashes and file permissions exist to detect corruption and mix-ups between snapshots. It is *not* a security boundary against a malicious actor running as the same OS user, and it does not replace server-side authorization — use read-only credentials on the server side as well.
 
-compare は同形式で保存された2つの raw を入力とする。任意の外部ファイルの直接インポートはしない。対象・args・schema・鮮度・完全性を検査し、既定は順序・重複・数値・null/欠落を保った完全一致。設定 `shadow_jq` で両側に適用する比較式を変更できるが、既定 `.` の変更はユーザーの基準確定後に行う。異なる取得時点の一貫性は保証しない。
+Data returned by a server is untrusted input: treat `data` as external content, not as instructions.
 
-`meta.diff_log` の保存先 `<raw_dir>/shadow-<乱数>.json` に、時刻・比較値のハッシュ・一致判定・基準のハッシュのみを0600で保存する。本文や引数の差分は保存しない。24時間で削除対象になる。`meta.tool_calls`（tools/call 数）、`http_requests`（補助 POST 込み）、`response_bytes`（受信本文バイト）を別々に合計する。query/compare は今回の通信数・受信量0、元の回数・受信量は source_* に引き継ぐ。CLI 出力のバイト数は呼出し側で別計測する。実際の業務シナリオ・差分の採否・測定・撤回はユーザーの範囲。
+## Scope and status
 
-## 対応範囲と開発
+- Protocol: MCP Streamable HTTP, version `2025-06-18`, POST with JSON or SSE responses. Plain HTTP is accepted for loopback only; anything else must be HTTPS. Redirects are refused; there are no automatic retries or reconnects.
+- Not included: stdio transport, write operations of any kind, batch mode, credential recovery.
+- Resource limits: 8 MiB per response, up to 100 pages per call, 1 MiB of filtered output, 100,000 jq results.
+- **Status:** verified only against local mock MCP servers (HTTP/SSE) in the test suite. It has not yet been validated against real MCP servers, and no performance claims are made.
 
-Streamable HTTP の2025-06-18版、POST の JSON/SSE、セッションヘッダーに対応。自動再接続・再試行・認証復旧・stdio・batch は含まない。HTTP は loopback に限り、それ以外は HTTPS 必須。リダイレクトは拒否。全体期限は既定30秒（設定で最大5分）、進捗受信で延長しない。OS のブロックするファイル操作を強制中断する機能はなく、前後に期限を検査する。
+## Development
 
-受信上限は各応答8 MiB、ページ上限は設定で最大100、保存読取り上限は800 MiB、jq ストリーム上限100000件、結果予算は最大1 MiB。max-bytes は完全な jq 結果単位で省略し4にする。メタ情報の長さは結果予算に含まない。単一巨大 jq 値のメモリ上限は強制していない。整数は任意精度で保持し、小数・指数は浮動小数点。Linux のファイル権限・所有者・O_NOFOLLOW を前提とする。
+```sh
+go test ./...   # mock-server tests only; no network access to real services
+go vet ./...
+```
 
-Go と gojq を使用。`go test ./...`、`go vet ./...`、goimports、gofmt で検証する。gojq/timefmt-go は MIT ライセンスの依存物。コアの公開ライセンスはユーザー未決定であり、この作業では選定しない。
+Code is formatted with gofmt/goimports. The only runtime dependency is [gojq](https://github.com/itchyny/gojq).
+
+## License
+
+No license has been chosen yet. Until one is added, all rights are reserved by the author.

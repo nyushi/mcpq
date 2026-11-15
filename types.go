@@ -36,12 +36,50 @@ type Server struct {
 	Tools               map[string]Policy `json:"tools"`
 }
 type Policy struct {
+	Shape        *ShapePolicy        `json:"shape,omitempty"`
 	SchemaHash   string              `json:"schema_hash"`
 	Args         map[string][]any    `json:"args"`
 	Required     []string            `json:"required"`
 	Page         *Page               `json:"page,omitempty"`
 	Completeness *CompletenessPolicy `json:"completeness,omitempty"`
 }
+type ShapePolicy struct {
+	Required []string `json:"required,omitempty"`
+	Optional []string `json:"optional,omitempty"`
+}
+
+func (s *ShapePolicy) UnmarshalJSON(b []byte) error {
+	var fields struct {
+		Required json.RawMessage `json:"required"`
+		Optional json.RawMessage `json:"optional"`
+	}
+	if err := decodeAs(b, &fields); err != nil {
+		return err
+	}
+	seen := map[string]bool{}
+	for _, field := range []struct {
+		raw  json.RawMessage
+		dest *[]string
+	}{{fields.Required, &s.Required}, {fields.Optional, &s.Optional}} {
+		if len(field.raw) == 0 {
+			continue
+		}
+		var values []any
+		if err := json.Unmarshal(field.raw, &values); err != nil || values == nil {
+			return fail(5, "config_shape")
+		}
+		for _, v := range values {
+			key, ok := v.(string)
+			if !ok || seen[key] {
+				return fail(5, "config_shape")
+			}
+			seen[key] = true
+			*field.dest = append(*field.dest, key)
+		}
+	}
+	return nil
+}
+
 type CompletenessPolicy struct {
 	Mode     string `json:"mode"`
 	Items    string `json:"items,omitempty"`

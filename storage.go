@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -193,8 +194,14 @@ func (a *App) checkSnapshot(ctx context.Context, c Config, id, server, tool stri
 	if s.Meta.Complete != "true" && s.Meta.Complete != "false" && s.Meta.Complete != "unknown" {
 		return s, fail(2, "snapshot_complete")
 	}
-	if _, e = merged(s.Pages, p); e != nil {
+	value, e := merged(s.Pages, p)
+	if e != nil {
 		return s, e
+	}
+	if p.Shape != nil {
+		if e = shape(ctx, c, &s.Meta, value, false); e != nil {
+			return s, e
+		}
 	}
 	age := a.now().Sub(s.Meta.FetchedAt)
 	secs := age.Seconds()
@@ -211,6 +218,13 @@ func shape(ctx context.Context, c Config, m *Meta, v any, accept bool) error {
 	if ctx.Err() != nil {
 		return fail(2, "deadline")
 	}
+	if d := c.Servers[m.Server].Tools[m.Tool].Shape; d != nil {
+		if accept {
+			return fail(1, "declared_shape_accept")
+		}
+		return declaredShape(m, v, d)
+	}
+
 	name := "shape-" + hashValue([]string{m.Server, m.Tool}) + ".json"
 	ks := keys(v)
 	b, _ := json.Marshal(ks)
@@ -257,6 +271,20 @@ func shape(ctx context.Context, c Config, m *Meta, v any, accept bool) error {
 		return nil
 	}
 	m.Shape = "unchanged"
+	return nil
+}
+
+func declaredShape(m *Meta, v any, d *ShapePolicy) error {
+	m.Shape = "declared"
+	m.ShapeAdded, m.ShapeRemoved = nil, nil
+	ks := keys(v)
+	added := keyDifference(ks, append(append([]string{}, d.Required...), d.Optional...))
+	removed := keyDifference(d.Required, ks)
+	sort.Strings(removed)
+	if len(added) > 0 || len(removed) > 0 {
+		m.ShapeAdded, m.ShapeRemoved = &added, &removed
+		return fail(2, "shape_changed")
+	}
 	return nil
 }
 
@@ -312,6 +340,11 @@ func (a *App) readBaseline(ctx context.Context, o options, p Policy, left Meta) 
 	}
 	s.Pages = []any{v}
 	s.Meta.ContentBlocks = blocks
+	if p.Shape != nil {
+		if e = declaredShape(&s.Meta, value, p.Shape); e != nil {
+			return s, e
+		}
+	}
 	s.Meta.Complete = declaredCompleteness(ctx, p, value, left.Args)
 	if p.Page != nil {
 		s.Meta.Complete = "true"

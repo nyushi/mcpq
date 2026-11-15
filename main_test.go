@@ -79,6 +79,9 @@ func fixture(t *testing.T, mode string) (*App, *int) {
 				return
 			}
 			target := map[string]any{"items": []any{json.Number("9007199254740993123456789")}, "next": nil}
+			if mode == "declared-alternating" && calls%2 == 0 {
+				delete(target, "next")
+			}
 			if mode == "truncate" {
 				target["items"] = []any{1, 2}
 			}

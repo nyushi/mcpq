@@ -223,6 +223,9 @@ func (a *App) Run(args []string) (env Envelope, code int) {
 	if e != nil {
 		return finish(e)
 	}
+	if o.acceptShape && c.Servers[o.server].Tools[o.tool].Shape != nil {
+		return finish(fail(1, "declared_shape_accept"))
+	}
 	if o.command == "query" || o.command == "compare" {
 		upper := duration(c.MaxAge)
 		if !o.ageExplicit {
@@ -349,7 +352,11 @@ func (a *App) Run(args []string) (env Envelope, code int) {
 		}
 		env.Meta = left.Meta
 		if le != nil || re != nil {
-			return finish(prefer(le, re))
+			chosen := prefer(le, re)
+			if re != nil && brief(chosen) == "shape_changed" && brief(re) == "shape_changed" && (le == nil || brief(le) != "shape_changed") {
+				env.Meta.Shape, env.Meta.ShapeAdded, env.Meta.ShapeRemoved = right.Meta.Shape, right.Meta.ShapeAdded, right.Meta.ShapeRemoved
+			}
+			return finish(chosen)
 		}
 		if hashValue(left.Meta.Args) != hashValue(right.Meta.Args) {
 			return finish(fail(2, "compare_arguments"))
@@ -362,7 +369,11 @@ func (a *App) Run(args []string) (env Envelope, code int) {
 		if e := shape(ctx, c, &env.Meta, lp, false); e != nil {
 			return finish(e)
 		}
-		if hashValue(keys(lp)) != hashValue(keys(rp)) {
+		if p.Shape != nil {
+			if e := shape(ctx, c, &env.Meta, rp, false); e != nil {
+				return finish(e)
+			}
+		} else if hashValue(keys(lp)) != hashValue(keys(rp)) {
 			return finish(fail(2, "compare_shape"))
 		}
 		jq, e := compile(c.Shadow)

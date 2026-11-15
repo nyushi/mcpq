@@ -172,7 +172,7 @@ An external baseline file must contain one tools/call **result object**, with `s
 
 The caller asserts that an external baseline came from the same server/tool/arguments and that its declared time is correct; these facts cannot be authenticated from the result JSON. For a paginated tool the external result must satisfy the configured items/next paths and terminal-page completeness rule: no next cursor and fewer items than the requested limit. A nonterminal or full page exits with code 4. For a tool without pagination, the external side follows its `completeness` declaration: `single` treats a valid result with matching shape as complete; `limit` counts its selected items against the limit argument saved in the stored snapshot. A full array is incomplete; an absent limit or ambiguous/non-array selection is unknown. `signal` checks the external response itself using the same declared markers; it needs no saved arguments. Without a declaration the external side is unknown. Incomplete or unknown comparisons exit with code 4. The stored side must independently have saved `complete: true`; query and compare preserve saved completeness rather than upgrading it under a new declaration.
 
-Response fingerprints contain **only the top-level keys** of the selected/merged response. Tools with optional keys may stop frequently. Without `--accept-shape-change`, changed keys exit with code 2 and the fingerprint stays unchanged. The flag is supported only by `call`; it does not bypass assertions, pagination, or jq checks. An accepted change writes a private diff log referenced by `meta.diff_log`, containing old/new key sets and added/removed keys, never response values. Key names themselves are recorded. The fingerprint is replaced atomically and retained across the 24-hour cleanup; the diff log expires like other logs. A later rejection does not roll back an explicitly accepted fingerprint change.
+Response fingerprints contain **only the top-level keys** of the selected/merged response. Fingerprints use the first observed response as their baseline. For tools whose top-level keys may be omitted, declare `shape` as described below; otherwise normal responses can stop with `shape_changed`. Without `--accept-shape-change`, changed keys exit with code 2 and the fingerprint stays unchanged. The flag is supported only by `call`; it does not bypass assertions, pagination, or jq checks. An accepted change writes a private diff log referenced by `meta.diff_log`, containing old/new key sets and added/removed keys, never response values. Key names themselves are recorded. The fingerprint is replaced atomically and retained across the 24-hour cleanup; the diff log expires like other logs. A later rejection does not roll back an explicitly accepted fingerprint change.
 
 ## Safety model
 
@@ -201,3 +201,19 @@ Code is formatted with gofmt/goimports. The only runtime dependency is [gojq](ht
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+
+### Declared response keys
+
+A tool policy may declare the top-level keys of the selected/merged response (the existing structured-content selection rules still apply):
+
+```json
+"shape": {
+  "required": ["sprigs"],
+  "optional": ["glimmers"]
+}
+```
+
+`required` and `optional` are arrays of strings. Keys must be unique within and across both arrays; invalid declarations exit with code 5. Either array may be omitted or empty, including both. A non-object response has an empty key set. Missing required keys exit with code 2 (`shape_changed`) and appear in `meta.shape_removed`; undeclared keys similarly appear in `meta.shape_added`. Optional keys may appear and disappear freely. Successful validation reports `meta.shape: "declared"`.
+
+Declared tools use the same fixed checks in `call`, `query`, and `compare`, including saved snapshots and external baselines. They neither read nor write fingerprint files. `--accept-shape-change` is rejected with code 1 before networking: edit the declaration instead. Without `shape`, existing fingerprint behavior is unchanged. When both declaration arrays are empty, only an empty key set passes. Comparison still compares values after shape validation, so allowed optional-key differences can produce `compare_difference` unless the configured shadow selection excludes them.

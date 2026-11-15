@@ -197,4 +197,4 @@ Code is formatted with gofmt/goimports. The only runtime dependency is [gojq](ht
 
 ## License
 
-No license has been chosen yet. Until one is added, all rights are reserved by the author.
+MIT — see [LICENSE](LICENSE).
